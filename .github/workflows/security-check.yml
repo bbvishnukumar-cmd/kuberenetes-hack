@@ -1,0 +1,99 @@
+name: Security Checks
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+# This workflow intentionally has no deployment environment or deployment secrets.
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  validate:
+    name: Tests, RBAC scan, ML analysis, and security gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RBAC_SECURITY_SCORE_THRESHOLD: ${{ vars.RBAC_SECURITY_SCORE_THRESHOLD || '80' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.2.21'
+
+      - name: Install locked dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run application checks
+        run: |
+          bun run lint
+          bun run build
+          bun run test
+
+      - name: Identify changed Kubernetes manifests
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mkdir -p .rbac-artifacts
+          git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- '*.yaml' '*.yml' > .rbac-artifacts/manifest-files.txt
+          printf 'Scanning these changed manifests:\n'
+          cat .rbac-artifacts/manifest-files.txt || true
+
+      - name: Run deterministic RBAC scan before ML
+        run: |
+          bunx tsx scripts/scan-rbac.ts \
+            --file-list .rbac-artifacts/manifest-files.txt \
+            --output .rbac-artifacts/preliminary-security-result.json \
+            --sarif .rbac-artifacts/preliminary-rbac-guardian.sarif \
+            --allow-empty
+
+      - name: Run configured pre-trained Random Forest predictor
+        env:
+          RBAC_ML_PREDICT_COMMAND: ${{ vars.RBAC_ML_PREDICT_COMMAND }}
+          RBAC_SCAN_INPUT: ${{ github.workspace }}/.rbac-artifacts/preliminary-security-result.json
+          RBAC_ML_OUTPUT: ${{ github.workspace }}/.rbac-artifacts/ml-risk.json
+        run: |
+          if [ -z "$RBAC_ML_PREDICT_COMMAND" ]; then
+            printf '{"error":"RBAC_ML_PREDICT_COMMAND is not configured"}\n' > "$RBAC_ML_OUTPUT"
+            echo "A real pre-trained ML predictor is required; no prediction was fabricated."
+            exit 0
+          fi
+          bash -euo pipefail -c "$RBAC_ML_PREDICT_COMMAND"
+
+      - name: Generate SARIF and enforce security gate
+        id: security_gate
+        continue-on-error: true
+        run: |
+          bunx tsx scripts/scan-rbac.ts \
+            --file-list .rbac-artifacts/manifest-files.txt \
+            --output .rbac-artifacts/security-result.json \
+            --sarif .rbac-artifacts/rbac-guardian.sarif \
+            --ml-result .rbac-artifacts/ml-risk.json \
+            --require-ml \
+            --allow-empty \
+            --enforce-gate
+
+      - name: Upload SARIF
+        if: always() && hashFiles('.rbac-artifacts/rbac-guardian.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: .rbac-artifacts/rbac-guardian.sarif
+
+      - name: Save security evidence for the trusted deployment workflow
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rbac-security-results
+          path: .rbac-artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Fail when the gate is not satisfied
+        if: steps.security_gate.outcome == 'failure'
+        run: exit 1

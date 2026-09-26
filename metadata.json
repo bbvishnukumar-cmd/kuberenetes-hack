@@ -1,0 +1,6 @@
+{
+  "name": "RBAC GUARDIAN",
+  "description": "Kubernetes RBAC Security & Attack Path Analyzer - See the Permission. Trace the Risk. Fix the Policy.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

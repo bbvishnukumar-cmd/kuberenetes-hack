@@ -1,0 +1,223 @@
+name: Production Deployment
+
+on:
+  workflow_run:
+    workflows: ['Security Checks']
+    types: [completed]
+
+# workflow_run uses the trusted default-branch workflow. It must never execute PR code
+# before the protected environment gate has approved the deployment job.
+permissions:
+  actions: read
+  contents: read
+  deployments: read
+  issues: write
+  pull-requests: write
+  security-events: write
+
+concurrency:
+  group: production-deployment-${{ github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      RBAC_SECURITY_SCORE_THRESHOLD: ${{ vars.RBAC_SECURITY_SCORE_THRESHOLD || '80' }}
+    outputs:
+      eligible: ${{ steps.status.outputs.eligible }}
+      pr_number: ${{ steps.status.outputs.pr_number }}
+      head_sha: ${{ steps.status.outputs.head_sha }}
+    steps:
+      - name: Check out trusted scanner implementation from the default branch
+        if: github.event.workflow_run.conclusion == 'success'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Install trusted scanner dependencies
+        if: github.event.workflow_run.conclusion == 'success'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.2.21'
+
+      - name: Install locked dependencies
+        if: github.event.workflow_run.conclusion == 'success'
+        run: bun install --frozen-lockfile
+
+      - name: Fetch changed PR manifests as data without checking out or executing PR code
+        if: github.event.workflow_run.conclusion == 'success'
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const prNumber = Number(process.env.PR_NUMBER);
+            const files = await github.paginate(github.rest.pulls.listFiles, { owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber, per_page: 100 });
+            fs.mkdirSync('.approval-manifests', { recursive: true });
+            const manifestFiles = [];
+            for (const file of files) {
+              if (!/\.ya?ml$/i.test(file.filename) || file.status === 'removed') continue;
+              if (file.filename.includes('..') || path.isAbsolute(file.filename)) throw new Error(`Unsafe manifest path: ${file.filename}`);
+              const response = await github.rest.repos.getContent({ owner: context.repo.owner, repo: context.repo.repo, path: file.filename, ref: process.env.HEAD_SHA });
+              if (Array.isArray(response.data) || response.data.type !== 'file' || response.data.encoding !== 'base64') throw new Error(`Unable to read manifest: ${file.filename}`);
+              const outputPath = path.join('.approval-manifests', file.filename);
+              fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+              fs.writeFileSync(outputPath, Buffer.from(response.data.content.replace(/\n/g, ''), 'base64'));
+              manifestFiles.push(outputPath.replaceAll('\\', '/'));
+            }
+            fs.writeFileSync('.approval-manifests/files.txt', `${manifestFiles.join('\n')}\n`);
+
+      - name: Run trusted deterministic RBAC scan before ML
+        if: github.event.workflow_run.conclusion == 'success'
+        run: |
+          bunx tsx scripts/scan-rbac.ts \
+            --file-list .approval-manifests/files.txt \
+            --output .rbac-artifacts/preliminary-security-result.json \
+            --sarif .rbac-artifacts/preliminary-rbac-guardian.sarif \
+            --allow-empty
+
+      - name: Run configured pre-trained Random Forest predictor
+        if: github.event.workflow_run.conclusion == 'success'
+        env:
+          RBAC_ML_PREDICT_COMMAND: ${{ vars.RBAC_ML_PREDICT_COMMAND }}
+          RBAC_SCAN_INPUT: ${{ github.workspace }}/.rbac-artifacts/preliminary-security-result.json
+          RBAC_ML_OUTPUT: ${{ github.workspace }}/.rbac-artifacts/ml-risk.json
+        run: |
+          if [ -z "$RBAC_ML_PREDICT_COMMAND" ]; then
+            printf '{"error":"RBAC_ML_PREDICT_COMMAND is not configured"}\n' > "$RBAC_ML_OUTPUT"
+            exit 0
+          fi
+          bash -euo pipefail -c "$RBAC_ML_PREDICT_COMMAND"
+
+      - name: Generate trusted SARIF and enforce trusted security gate
+        if: github.event.workflow_run.conclusion == 'success'
+        id: trusted_security_gate
+        continue-on-error: true
+        run: |
+          bunx tsx scripts/scan-rbac.ts \
+            --file-list .approval-manifests/files.txt \
+            --output .rbac-artifacts/security-result.json \
+            --sarif .rbac-artifacts/rbac-guardian.sarif \
+            --ml-result .rbac-artifacts/ml-risk.json \
+            --require-ml \
+            --allow-empty \
+            --enforce-gate
+
+      - name: Upload trusted SARIF
+        if: always() && hashFiles('.rbac-artifacts/rbac-guardian.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: .rbac-artifacts/rbac-guardian.sarif
+
+      - name: Create or update the deployment approval request
+        id: status
+        uses: actions/github-script@v7
+        env:
+          WORKFLOW_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        with:
+          script: |
+            const fs = require('fs');
+            const pr = context.payload.workflow_run.pull_requests?.[0];
+            if (!pr) {
+              core.setOutput('eligible', 'false');
+              return;
+            }
+            const marker = '<!-- rbac-guardian-deployment-approval -->';
+            let report = null;
+            try { report = JSON.parse(fs.readFileSync('.rbac-artifacts/security-result.json', 'utf8')); } catch (_) {}
+            const passed = process.env.WORKFLOW_CONCLUSION === 'success' && report?.gate?.passed === true;
+            const counts = report?.severityCounts || {};
+            const summary = passed
+              ? `## Deployment Approval Required\n\nDeveloper: @${pr.user.login}\n\nPull Request: #${pr.number} — ${pr.title}\n\nSecurity Scan: **PASSED**\n\nSecurity Score: **${report.score}/100**\n\nRule Risk: **${report.ruleRisk}**\n\nML Risk: **${report.mlRisk}**\n\nFindings: Critical ${counts.CRITICAL || 0} · High ${counts.HIGH || 0} · Medium ${counts.MEDIUM || 0} · Low ${counts.LOW || 0}\n\nSARIF: **Generated**\n\nEnvironment: **Production**\n\nStatus: **WAITING FOR TL APPROVAL**\n\nTL: review the protected Production environment deployment in GitHub Actions.\n\n${marker}`
+              : `## Deployment Blocked by Security Gate\n\nPull Request: #${pr.number} — ${pr.title}\n\nThe required tests, RBAC scan, ML analysis, SARIF generation, or security gate did not pass. No deployment approval was requested.\n\n${report?.gate?.reasons?.length ? `Reasons:\n${report.gate.reasons.map((reason) => `- ${reason}`).join('\n')}\n\n` : ''}Inspect the Security Checks workflow logs and SARIF results. Findings reported by the scanner retain only verified file/resource data; no source line is claimed when the parser cannot prove it.\n\n${marker}`;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner: context.repo.owner, repo: context.repo.repo, issue_number: pr.number, per_page: 100 });
+            const existing = comments.find((comment) => comment.user?.type === 'Bot' && comment.body?.includes(marker));
+            if (existing) await github.rest.issues.updateComment({ owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body: summary });
+            else await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: pr.number, body: summary });
+            const stateLabels = ['deployment-pending', 'deployment-approved', 'deployment-rejected', 'deployment-blocked'];
+            for (const label of stateLabels) {
+              try { await github.rest.issues.removeLabel({ owner: context.repo.owner, repo: context.repo.repo, issue_number: pr.number, name: label }); } catch (_) {}
+            }
+            await github.rest.issues.addLabels({ owner: context.repo.owner, repo: context.repo.repo, issue_number: pr.number, labels: [passed ? 'deployment-pending' : 'deployment-blocked'] });
+            core.setOutput('eligible', String(passed));
+            core.setOutput('pr_number', String(pr.number));
+            core.setOutput('head_sha', process.env.HEAD_SHA);
+
+  deploy:
+    needs: prepare
+    if: needs.prepare.outputs.eligible == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: production
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Revalidate pull request before accessing production secrets
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
+          EXPECTED_SHA: ${{ needs.prepare.outputs.head_sha }}
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.get({ owner: context.repo.owner, repo: context.repo.repo, pull_number: Number(process.env.PR_NUMBER) });
+            if (pr.state !== 'open' || pr.head.sha !== process.env.EXPECTED_SHA) core.setFailed('Pull request is closed or changed since the approved security scan. Re-run Security Checks.');
+
+      - name: Check out the reviewed pull request revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.head_sha }}
+
+      - name: Deploy using production environment configuration
+        env:
+          PRODUCTION_DEPLOY_COMMAND: ${{ secrets.PRODUCTION_DEPLOY_COMMAND }}
+        run: |
+          if [ -z "$PRODUCTION_DEPLOY_COMMAND" ]; then
+            echo "PRODUCTION_DEPLOY_COMMAND is not configured as a production environment secret."
+            exit 1
+          fi
+          bash -euo pipefail -c "$PRODUCTION_DEPLOY_COMMAND"
+
+  finalize:
+    needs: [prepare, deploy]
+    if: always() && needs.prepare.outputs.pr_number != ''
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Record deployment outcome in the single approval comment
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+        with:
+          script: |
+            const marker = '<!-- rbac-guardian-deployment-approval -->';
+            const number = Number(process.env.PR_NUMBER);
+            const comments = await github.paginate(github.rest.issues.listComments, { owner: context.repo.owner, repo: context.repo.repo, issue_number: number, per_page: 100 });
+            const existing = comments.find((comment) => comment.user?.type === 'Bot' && comment.body?.includes(marker));
+            if (!existing) return;
+            let review = null;
+            try {
+              const { data } = await github.request('GET /repos/{owner}/{repo}/actions/runs/{run_id}/approvals', { owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId });
+              review = data.find((item) => ['approved', 'rejected'].includes(item.state));
+            } catch (_) {}
+            const deployed = process.env.DEPLOY_RESULT === 'success';
+            const status = deployed ? '✅ Deployment Completed' : review?.state === 'rejected' ? '🔴 Deployment Rejected — CANCELLED' : '⚫ Deployment did not start or failed';
+            const reviewer = review?.user?.login ? `\n\nReviewed by: @${review.user.login}` : '';
+            const body = `${existing.body.split(marker)[0]}\n\n---\n\n${status}${reviewer}\n\nRecorded: ${new Date().toISOString()}\n\n${marker}`;
+            await github.rest.issues.updateComment({ owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body });
+            const stateLabels = ['deployment-pending', 'deployment-approved', 'deployment-rejected', 'deployment-blocked'];
+            for (const label of stateLabels) {
+              try { await github.rest.issues.removeLabel({ owner: context.repo.owner, repo: context.repo.repo, issue_number: number, name: label }); } catch (_) {}
+            }
+            await github.rest.issues.addLabels({ owner: context.repo.owner, repo: context.repo.repo, issue_number: number, labels: [deployed ? 'deployment-approved' : review?.state === 'rejected' ? 'deployment-rejected' : 'deployment-blocked'] });
